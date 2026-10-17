@@ -152,6 +152,7 @@ private val HAND_LINKS = listOf(
 fun CameraPreview() {
     val context = LocalContext.current
     val lifecycleOwner = context as ComponentActivity
+    val alignment = rememberCameraAlignment()
 
     var points by remember { mutableStateOf<List<Offset>>(emptyList()) }
     var frame by remember { mutableStateOf<Bitmap?>(null) }
