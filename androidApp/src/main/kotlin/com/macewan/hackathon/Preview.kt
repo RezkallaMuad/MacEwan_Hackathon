@@ -60,6 +60,9 @@ import com.google.mediapipe.tasks.vision.objectdetector.ObjectDetectorResult
 import java.util.concurrent.Executors
 import kotlin.math.hypot
 import kotlinx.coroutines.delay
+import androidx.camera.core.Camera
+import android.speech.tts.TextToSpeech
+import java.util.Locale
 
 enum class AppMode {
     IDLE, LISTING, TARGET_RANGE
@@ -81,7 +84,7 @@ fun CameraScreen() {
     if (hasPermission) {
         CameraPreview()
     } else {
-        Box(Modifier.fillMaxSize()) {
+        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
             Text("Camera permission needed")
         }
         LaunchedEffect(Unit) { launcher.launch(Manifest.permission.CAMERA) }
@@ -150,6 +153,13 @@ fun CameraPreview() {
     var points by remember { mutableStateOf<List<Offset>>(emptyList()) }
     var frame by remember { mutableStateOf<Bitmap?>(null) }
     var fps by remember { mutableIntStateOf(0) }
+
+    // camera and torch states
+    var camera by remember { mutableStateOf<Camera?>(null) }
+    var isTorchOn by remember { mutableStateOf(false) }
+
+    // tts
+    var tts by remember { mutableStateOf<TextToSpeech?>(null) }
 
     var detectedObjects by remember { mutableStateOf<List<DetectedItem>>(emptyList()) }
     val objectDetector = remember { createObjectDetector(context) { detectedObjects = it } }
@@ -267,7 +277,7 @@ fun CameraPreview() {
             lockedBox = match.boundingBox
             lockedAt = now
 
-            // NEW: If we just found it and haven't announced it yet, say it!
+            // ff we just found it and haven't announced it yet, say it
             if (!hasAnnouncedFound) {
                 speaker.say("Found $targetLabel in view")
                 hasAnnouncedFound = true
@@ -275,7 +285,7 @@ fun CameraPreview() {
 
         } else if (now - lockedAt > 3000) {
             lockedBox = null
-            // NEW: Reset if the object is out of view for 3 seconds so it will announce again when refound
+            //  reset if the object is out of view for 3 seconds so it will announce again when refound
             hasAnnouncedFound = false
         }
 
@@ -347,10 +357,7 @@ fun CameraPreview() {
             }
 
             provider.unbindAll()
-            val camera = provider.bindToLifecycle(lifecycleOwner, CameraSelector.DEFAULT_BACK_CAMERA, analysis)
-
-            val minZoom = camera.cameraInfo.zoomState.value?.minZoomRatio ?: 1f
-            camera.cameraControl.setZoomRatio(minZoom)
+            provider.bindToLifecycle(lifecycleOwner, CameraSelector.DEFAULT_BACK_CAMERA, analysis)
         }, ContextCompat.getMainExecutor(context))
 
         onDispose {
@@ -362,6 +369,19 @@ fun CameraPreview() {
             voice.destroy()
             speaker.shutdown()
         }
+    }
+
+    rememberShakeDetector {
+        // toggle the boolean
+        val nextTorchState = !isTorchOn
+        isTorchOn = nextTorchState
+
+        // turn the flash light on and off
+        camera?.cameraControl?.enableTorch(nextTorchState)
+
+        // tts the status of the flashlight
+        val announcement = if (nextTorchState) "Flashlight on" else "Flashlight off"
+        tts?.speak(announcement, TextToSpeech.QUEUE_FLUSH, null, null)
     }
 
     // ---- Full Screen Touch Handler & UI ----
