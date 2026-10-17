@@ -81,7 +81,7 @@ fun CameraScreen() {
     if (hasPermission) {
         CameraPreview()
     } else {
-        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        Box(Modifier.fillMaxSize()) {
             Text("Camera permission needed")
         }
         LaunchedEffect(Unit) { launcher.launch(Manifest.permission.CAMERA) }
@@ -347,7 +347,10 @@ fun CameraPreview() {
             }
 
             provider.unbindAll()
-            provider.bindToLifecycle(lifecycleOwner, CameraSelector.DEFAULT_BACK_CAMERA, analysis)
+            val camera = provider.bindToLifecycle(lifecycleOwner, CameraSelector.DEFAULT_BACK_CAMERA, analysis)
+
+            val minZoom = camera.cameraInfo.zoomState.value?.minZoomRatio ?: 1f
+            camera.cameraControl.setZoomRatio(minZoom)
         }, ContextCompat.getMainExecutor(context))
 
         onDispose {
@@ -382,12 +385,12 @@ fun CameraPreview() {
     ) {
         val bmp = frame
         if (bmp != null) {
-            Box(Modifier.fillMaxWidth().aspectRatio(bmp.width.toFloat() / bmp.height)) {
+            Box(Modifier.fillMaxSize()) {
                 Image(
                     bitmap = bmp.asImageBitmap(),
                     contentDescription = null,
                     modifier = Modifier.fillMaxSize(),
-                    contentScale = ContentScale.FillBounds
+                    contentScale = ContentScale.Crop
                 )
                 Canvas(Modifier.fillMaxSize()) {
                     val pts = points
