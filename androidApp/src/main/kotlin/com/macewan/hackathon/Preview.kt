@@ -56,10 +56,14 @@ import java.util.concurrent.Executors
 import com.google.mediapipe.tasks.vision.objectdetector.ObjectDetector
 import com.google.mediapipe.tasks.vision.objectdetector.ObjectDetectorResult
 import android.graphics.RectF
+import kotlin.math.hypot
+import androidx.compose.runtime.mutableLongStateOf
 
 
 @Composable
 fun CameraScreen() {
+    val beeper = remember{ ProximityBeeper() }
+    LaunchedEffect(Unit) { beeper.start(this)}
     val context = LocalContext.current
     var hasPermission by remember {
         mutableStateOf(
@@ -159,6 +163,37 @@ fun CameraPreview() {
     val executor = remember { Executors.newSingleThreadExecutor() }
     val landmarker = remember { createLandmarker(context) { points = it } }
     val textMeasurer = rememberTextMeasurer()
+
+    val beeper = remember { ProximityBeeper() }
+    LaunchedEffect(Unit) { beeper.start(this) }
+
+    var targetLabel by remember { mutableStateOf("bottle") }   // voice command will set this later
+    var lockedBox by remember { mutableStateOf<RectF?>(null) }
+    var lockedAt by remember { mutableLongStateOf(0L) }
+
+    LaunchedEffect(points, detectedObjects, targetLabel) {
+        val bmp = frame ?: return@LaunchedEffect
+        val now = SystemClock.uptimeMillis()
+
+        // remember the target's last position, and forget it after 3 s unseen
+        val match = detectedObjects.filter { it.label == targetLabel }.maxByOrNull { it.score }
+        if (match != null) {
+            lockedBox = match.boundingBox
+            lockedAt = now
+        } else if (now - lockedAt > 3000) {
+            lockedBox = null
+        }
+
+        val box = lockedBox
+        beeper.distance = if (points.size == 21 && box != null) {
+            val fx = points[8].x * bmp.width
+            val fy = points[8].y * bmp.height
+            // distance to the box edge, so it is 0 when the finger is on the object
+            val dx = maxOf(box.left - fx, 0f, fx - box.right)
+            val dy = maxOf(box.top - fy, 0f, fy - box.bottom)
+            (hypot(dx, dy) / (bmp.width * 0.5f)).coerceIn(0f, 1f)
+        } else null
+    }
 
     DisposableEffect(Unit) {
         var lastTimestamp = 0L
