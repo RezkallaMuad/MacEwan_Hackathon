@@ -107,7 +107,7 @@ private fun createLandmarker(context: Context, onResult: (List<Offset>) -> Unit)
 }
 
 data class DetectedItem(val label: String, val score: Float, val boundingBox: RectF)
-
+val IGNORED_LABELS = setOf("person", "dining table")
 private fun createObjectDetector(context: Context, onResult: (List<DetectedItem>) -> Unit): ObjectDetector {
     val base = BaseOptions.builder()
         .setModelAssetPath("efficientdet_lite0.tflite")
@@ -121,6 +121,10 @@ private fun createObjectDetector(context: Context, onResult: (List<DetectedItem>
         .setResultListener { result: ObjectDetectorResult, _ ->
             val items = result.detections().mapNotNull { detection ->
                 val category = detection.categories().firstOrNull() ?: return@mapNotNull null
+                val label = category.categoryName().lowercase()
+                if (label in IGNORED_LABELS ){
+                    return@mapNotNull null
+                }
                 val box = detection.boundingBox()
                 DetectedItem(
                     label = category.categoryName(),
@@ -200,6 +204,13 @@ fun CameraPreview() {
 
         delay(1000)
         speaker.say("Tap the screen to list items")
+
+        while (true) {
+            delay(5000)
+            if (appMode == AppMode.IDLE && targetLabel == null) {
+                speaker.say("Tap the screen to list items")
+            }
+        }
     }
 
     val voice = remember {
@@ -211,11 +222,12 @@ fun CameraPreview() {
                 hasAnnouncedFound = false // Reset the announcement tracker
                 speaker.say("Looking for $label.")
                 lastSpoken = "Target: $label"
-            } else {
+            } /*else {
                 speaker.say("I didn't catch that. Tap the screen to scan again.")
                 appMode = AppMode.IDLE
                 lastSpoken = "Voice failed. Tap to retry."
             }
+            */
         }
     }
 
@@ -277,7 +289,7 @@ fun CameraPreview() {
             lockedBox = match.boundingBox
             lockedAt = now
 
-            // ff we just found it and haven't announced it yet, say it
+            // NEW: If we just found it and haven't announced it yet, say it!
             if (!hasAnnouncedFound) {
                 speaker.say("Found $targetLabel in view")
                 hasAnnouncedFound = true
@@ -285,7 +297,7 @@ fun CameraPreview() {
 
         } else if (now - lockedAt > 3000) {
             lockedBox = null
-            //  reset if the object is out of view for 3 seconds so it will announce again when refound
+            // NEW: Reset if the object is out of view for 3 seconds so it will announce again when refound
             hasAnnouncedFound = false
         }
 
@@ -371,19 +383,6 @@ fun CameraPreview() {
         }
     }
 
-    rememberShakeDetector {
-        // toggle the boolean
-        val nextTorchState = !isTorchOn
-        isTorchOn = nextTorchState
-
-        // turn the flash light on and off
-        camera?.cameraControl?.enableTorch(nextTorchState)
-
-        // tts the status of the flashlight
-        val announcement = if (nextTorchState) "Flashlight on" else "Flashlight off"
-        tts?.speak(announcement, TextToSpeech.QUEUE_FLUSH, null, null)
-    }
-
     // ---- Full Screen Touch Handler & UI ----
     Box(
         Modifier
@@ -405,12 +404,12 @@ fun CameraPreview() {
     ) {
         val bmp = frame
         if (bmp != null) {
-            Box(Modifier.fillMaxSize()) {
+            Box(Modifier.fillMaxWidth().aspectRatio(bmp.width.toFloat() / bmp.height)) {
                 Image(
                     bitmap = bmp.asImageBitmap(),
                     contentDescription = null,
                     modifier = Modifier.fillMaxSize(),
-                    contentScale = ContentScale.Crop
+                    contentScale = ContentScale.FillBounds
                 )
                 Canvas(Modifier.fillMaxSize()) {
                     val pts = points
