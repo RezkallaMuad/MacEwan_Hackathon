@@ -116,7 +116,7 @@ private fun createObjectDetector(
     val options = ObjectDetector.ObjectDetectorOptions.builder()
         .setBaseOptions(base)
         .setRunningMode(RunningMode.LIVE_STREAM)
-        .setMaxResults(5) // Only keep top 5 objects on table
+        .setMaxResults(3) // Only keep top 5 objects on table
         .setScoreThreshold(0.45f) // Ignore low confidence predictions
         .setResultListener { result: ObjectDetectorResult, _ ->
             val items = result.detections().mapNotNull { detection ->
@@ -252,6 +252,36 @@ fun CameraPreview() {
                             drawCircle(Color.Red, 10f, Offset(p.x * size.width, p.y * size.height))
                         }
                     }
+                    val fingerTip = if (points.size == 21) {
+                        Offset(points[8].x * size.width, points[8].y * size.height)
+                    } else null
+
+                    val scaleX = size.width / bmp.width
+                    val scaleY = size.height / bmp.height
+
+
+                    // find which obejct is closest to the finger tip
+                    var targetObject: DetectedItem? = null
+                    var minDistince = Float.MAX_VALUE
+
+                    if (fingerTip != null && detectedObjects.isNotEmpty()) {
+                        detectedObjects.forEach { obj ->
+                            val objCenterX = ((obj.boundingBox.left + obj.boundingBox.right) / 2f) * scaleX
+                            val objCenterY = ((obj.boundingBox.top + obj.boundingBox.bottom) / 2f) * scaleY
+
+                            //calculate the distance between objects and fingertips
+                            val dx = fingerTip.x - objCenterX
+                            val dy = fingerTip.y - objCenterY
+                            val distance = kotlin.math.sqrt(dx * dx + dy * dy) //euclidian distance in pixels
+
+                            //set the mindistance to render the closest object
+                            if (distance < minDistince) {
+                                minDistince = distance
+                                targetObject = obj
+                            }
+                        }
+                    }
+
 
                     // draw the boxes for objects
                     detectedObjects.forEach { obj ->
@@ -304,6 +334,15 @@ fun CameraPreview() {
                         )
 
                         drawText(textLayoutResult = textLayoutResult, topLeft = Offset(left + 8f, textY + 4f))
+                    }
+
+                    //draw a tracking line from the index finger to the target object
+                    if (fingerTip != null && targetObject != null) {
+                        val target = targetObject
+                        val targetCenterX = ((target.boundingBox.left + target.boundingBox.right) / 2f) * scaleX
+                        val targetCenterY = ((target.boundingBox.top + target.boundingBox.bottom) / 2f) * scaleY
+
+                        drawLine(color=Color.Magenta, start=fingerTip, end= Offset(targetCenterX, targetCenterY), strokeWidth = 4f)
                     }
                 }
             }
