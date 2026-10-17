@@ -9,26 +9,17 @@ import android.os.Build
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
-import androidx.compose.foundation.background
-import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 
-/**
- * Holds the current alignment state of the camera.
- */
+import androidx.compose.ui.platform.LocalContext
+
+
+//holds current camera alignment
 enum class TiltDirection { PERFECT, TILT_DOWN, TILT_UP }
 
 data class AlignmentState(
@@ -37,9 +28,7 @@ data class AlignmentState(
     val direction: TiltDirection = TiltDirection.TILT_DOWN
 )
 
-/**
- * Composable hook to track phone tilt and buzz when aligned.
- */
+//composable hook to track when the phone should buzz
 @Composable
 fun rememberCameraAlignment(): AlignmentState {
     val context = LocalContext.current
@@ -63,7 +52,7 @@ fun rememberCameraAlignment(): AlignmentState {
         val rotationSensor = sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
         var wasAligned = false
 
-        // Arrays to hold matrix math
+        // arrays to hold matrix math
         val rotationMatrix = FloatArray(9)
         val orientationAngles = FloatArray(3)
 
@@ -89,7 +78,7 @@ fun rememberCameraAlignment(): AlignmentState {
 
 
                 //trigger the haptics on the loading
-                // A. User just ENTERED the sweet spot -> Double Buzz ("Lock on!")
+                // user enters the sweet spot
                 if (isCurrentlyAligned && !wasAligned) {
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                         // Timing pattern: [delay, vibrate, pause, vibrate]
@@ -101,7 +90,7 @@ fun rememberCameraAlignment(): AlignmentState {
                     }
                 }
 
-// B. User just SLIPPED OUT of the sweet spot -> Single Warning Buzz ("Lost lock!")
+                // user leaves the sweet spot single low buzz
                 if (!isCurrentlyAligned && wasAligned) {
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                         vibrator.vibrate(VibrationEffect.createOneShot(40L, VibrationEffect.DEFAULT_AMPLITUDE))
@@ -113,7 +102,7 @@ fun rememberCameraAlignment(): AlignmentState {
 
                 wasAligned = isCurrentlyAligned
 
-                // Update Compose UI state
+                // update the ui compose state
                 alignmentState = AlignmentState(
                     pitch = pitchDeg,
                     isAligned = isCurrentlyAligned
@@ -121,47 +110,22 @@ fun rememberCameraAlignment(): AlignmentState {
             }
 
             override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {
-                // Not needed for this
+                // dont really need this
             }
         }
 
-        // Register sensor listener
+        // register sensor listener
         sensorManager.registerListener(
             listener,
             rotationSensor,
             SensorManager.SENSOR_DELAY_UI
         )
 
-        // Cleanup when screen closes
+        // clean up screen close
         onDispose {
             sensorManager.unregisterListener(listener)
         }
     }
 
     return alignmentState
-}
-
-/**
- * Optional ready-to-use visual badge to display on screen during debugging.
- */
-@Composable
-fun AlignmentBadge(
-    state: AlignmentState,
-    modifier: Modifier = Modifier
-) {
-    val backgroundColor = if (state.isAligned) Color(0xFF2E7D32) else Color(0xFFC62828)
-    val text = if (state.isAligned) {
-        "Angle: ${state.pitch.toInt()}° (ALIGNED)"
-    } else {
-        "Angle: ${state.pitch.toInt()}° (TILT TO 45°)"
-    }
-
-    Text(
-        text = text,
-        color = Color.White,
-        fontSize = 12.sp,
-        modifier = modifier
-            .background(backgroundColor.copy(alpha = 0.85f), RoundedCornerShape(8.dp))
-            .padding(horizontal = 10.dp, vertical = 6.dp)
-    )
 }
