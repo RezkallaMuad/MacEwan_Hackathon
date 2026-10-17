@@ -1,7 +1,6 @@
 package com.macewan.hackathon
 
 import android.Manifest
-import android.R
 import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
