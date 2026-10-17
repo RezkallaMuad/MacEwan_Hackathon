@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Matrix
+import android.graphics.RectF
 import android.os.SystemClock
 import android.util.Log
 import androidx.activity.ComponentActivity
@@ -16,11 +17,11 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.material3.Text
@@ -29,41 +30,43 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.geometry.Size
-import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.drawText
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.rememberTextMeasurer
+import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import com.google.mediapipe.framework.image.BitmapImageBuilder
 import com.google.mediapipe.tasks.core.BaseOptions
 import com.google.mediapipe.tasks.vision.core.RunningMode
 import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarker
-import java.util.concurrent.Executors
 import com.google.mediapipe.tasks.vision.objectdetector.ObjectDetector
 import com.google.mediapipe.tasks.vision.objectdetector.ObjectDetectorResult
-import android.graphics.RectF
+import java.util.concurrent.Executors
 import kotlin.math.hypot
-import androidx.compose.runtime.mutableLongStateOf
+import kotlinx.coroutines.delay
 
+enum class AppMode {
+    IDLE, LISTING, TARGET_RANGE
+}
 
 @Composable
 fun CameraScreen() {
-    val beeper = remember{ ProximityBeeper() }
-    LaunchedEffect(Unit) { beeper.start(this)}
     val context = LocalContext.current
     var hasPermission by remember {
         mutableStateOf(
@@ -85,10 +88,7 @@ fun CameraScreen() {
     }
 }
 
-private fun createLandmarker(
-    context: Context,
-    onResult: (List<Offset>) -> Unit
-): HandLandmarker {
+private fun createLandmarker(context: Context, onResult: (List<Offset>) -> Unit): HandLandmarker {
     val base = BaseOptions.builder().setModelAssetPath("hand_landmarker.task").build()
     val options = HandLandmarker.HandLandmarkerOptions.builder()
         .setBaseOptions(base)
@@ -102,17 +102,10 @@ private fun createLandmarker(
         .build()
     return HandLandmarker.createFromOptions(context, options)
 }
-// create the object points for the object in view
-data class DetectedItem(
-    val label: String,
-    val score: Float,
-    val boundingBox: RectF //coords
-)
 
-private fun createObjectDetector(
-    context: Context,
-    onResult: (List<DetectedItem>) -> Unit
-): ObjectDetector {
+data class DetectedItem(val label: String, val score: Float, val boundingBox: RectF)
+
+private fun createObjectDetector(context: Context, onResult: (List<DetectedItem>) -> Unit): ObjectDetector {
     val base = BaseOptions.builder()
         .setModelAssetPath("efficientdet_lite0.tflite")
         .build()
@@ -120,8 +113,8 @@ private fun createObjectDetector(
     val options = ObjectDetector.ObjectDetectorOptions.builder()
         .setBaseOptions(base)
         .setRunningMode(RunningMode.LIVE_STREAM)
-        .setMaxResults(3) // Only keep top 5 objects on table
-        .setScoreThreshold(0.45f) // Ignore low confidence predictions
+        .setMaxResults(10)
+        .setScoreThreshold(0.45f)
         .setResultListener { result: ObjectDetectorResult, _ ->
             val items = result.detections().mapNotNull { detection ->
                 val category = detection.categories().firstOrNull() ?: return@mapNotNull null
@@ -152,7 +145,7 @@ private val HAND_LINKS = listOf(
 fun CameraPreview() {
     val context = LocalContext.current
     val lifecycleOwner = context as ComponentActivity
-    val alignment = rememberCameraAlignment()
+    val alignment = rememberCameraAlignment()   // teammate's tilt code
 
     var points by remember { mutableStateOf<List<Offset>>(emptyList()) }
     var frame by remember { mutableStateOf<Bitmap?>(null) }
@@ -167,41 +160,149 @@ fun CameraPreview() {
 
     val beeper = remember { ProximityBeeper() }
     LaunchedEffect(Unit) { beeper.start(this) }
+    val speaker = remember { Speaker(context) }
 
-    var targetLabel by remember { mutableStateOf("bottle") }   // voice command will set this later
+    // --- State for Tap-Driven Flow ---
+    var appMode by remember { mutableStateOf(AppMode.IDLE) }
+    var scanning by remember { mutableStateOf(false) }
+    var listening by remember { mutableStateOf(false) }
+    var targetLabel by remember { mutableStateOf<String?>(null) }
     var lockedBox by remember { mutableStateOf<RectF?>(null) }
     var lockedAt by remember { mutableLongStateOf(0L) }
+    var lastSpoken by remember { mutableStateOf("Tap screen to list items") }
 
-    LaunchedEffect(points, detectedObjects, targetLabel) {
+    // NEW: Track if we've already announced finding the target so it doesn't spam the speaker
+    var hasAnnouncedFound by remember { mutableStateOf(false) }
+
+    // --- Voice Setup ---
+    var micOk by remember {
+        mutableStateOf(
+            ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
+                    PackageManager.PERMISSION_GRANTED
+        )
+    }
+    val micLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { micOk = it }
+
+    LaunchedEffect(Unit) {
+        if (!micOk) micLauncher.launch(Manifest.permission.RECORD_AUDIO)
+
+        delay(1000)
+        speaker.say("Tap the screen to list items")
+    }
+
+    val voice = remember {
+        VoiceTarget(context) { label ->
+            listening = false
+            if (label != null) {
+                targetLabel = label
+                appMode = AppMode.TARGET_RANGE
+                hasAnnouncedFound = false // Reset the announcement tracker
+                speaker.say("Looking for $label.")
+                lastSpoken = "Target: $label"
+            } else {
+                speaker.say("I didn't catch that. Tap the screen to scan again.")
+                appMode = AppMode.IDLE
+                lastSpoken = "Voice failed. Tap to retry."
+            }
+        }
+    }
+
+    // ---- Mode 1: Listing Mode (Triggered by Tap) ----
+    LaunchedEffect(appMode) {
+        if (appMode == AppMode.LISTING) {
+            beeper.distance = null
+            scanning = true
+            listening = false
+            hasAnnouncedFound = false
+            lastSpoken = "Scanning..."
+
+            val seen = mutableMapOf<String, Int>()
+            val samples = 20
+            repeat(samples) {
+                detectedObjects.groupBy { it.label }.forEach { (label, _) ->
+                    seen[label] = (seen[label] ?: 0) + 1
+                }
+                delay(100)
+            }
+            scanning = false
+
+            val stable = seen.filter { it.value >= samples * 0.3 }.keys.toList()
+
+            if (stable.isNotEmpty()) {
+                val msg = "I see " + stable.joinToString(", ") + ". Say the item you want."
+                speaker.say(msg)
+                lastSpoken = "I see: ${stable.joinToString(", ")}"
+
+                delay((msg.length * 80L) + 1000L)
+
+                if (micOk && appMode == AppMode.LISTING) {
+                    listening = true
+                    lastSpoken = "Listening for your choice..."
+                    voice.listen()
+                }
+            } else {
+                val msg = "I don't see anything clearly. Tap to try again."
+                speaker.say(msg)
+                lastSpoken = "Nothing found."
+                appMode = AppMode.IDLE
+            }
+        }
+    }
+
+    // ---- Mode 2: Target Range Proximity Calculations ----
+    LaunchedEffect(points, detectedObjects, appMode) {
         val bmp = frame ?: return@LaunchedEffect
+        if (appMode != AppMode.TARGET_RANGE || listening || targetLabel == null) {
+            beeper.distance = null
+            return@LaunchedEffect
+        }
+
+        val pts = points
         val now = SystemClock.uptimeMillis()
 
-        // remember the target's last position, and forget it after 3 s unseen
         val match = detectedObjects.filter { it.label == targetLabel }.maxByOrNull { it.score }
         if (match != null) {
             lockedBox = match.boundingBox
             lockedAt = now
+
+            // NEW: If we just found it and haven't announced it yet, say it!
+            if (!hasAnnouncedFound) {
+                speaker.say("Found $targetLabel in view")
+                hasAnnouncedFound = true
+            }
+
         } else if (now - lockedAt > 3000) {
             lockedBox = null
+            // NEW: Reset if the object is out of view for 3 seconds so it will announce again when refound
+            hasAnnouncedFound = false
         }
 
         val box = lockedBox
-        beeper.distance = if (points.size == 21 && box != null) {
-            val fx = points[8].x * bmp.width
-            val fy = points[8].y * bmp.height
-            // distance to the box edge, so it is 0 when the finger is on the object
+        var result: Float? = null
+
+        if (pts.size == 21 && box != null) {
+            val fx = pts[8].x * bmp.width
+            val fy = pts[8].y * bmp.height
             val dx = maxOf(box.left - fx, 0f, fx - box.right)
             val dy = maxOf(box.top - fy, 0f, fy - box.bottom)
-            (hypot(dx, dy) / (bmp.width * 0.5f)).coerceIn(0f, 1f)
-        } else null
+            result = (hypot(dx, dy) / (bmp.width * 0.5f)).coerceIn(0f, 1f)
+
+            // teammate's tilt/buzz code can go here
+        }
+        beeper.distance = result
     }
 
+    // ---- Camera + Detection Pipeline ----
     DisposableEffect(Unit) {
         var lastTimestamp = 0L
+        var cameraProvider: ProcessCameraProvider? = null
 
         val providerFuture = ProcessCameraProvider.getInstance(context)
         providerFuture.addListener({
             val provider = providerFuture.get()
+            cameraProvider = provider
 
             val analysis = ImageAnalysis.Builder()
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
@@ -222,21 +323,17 @@ fun CameraPreview() {
 
                     val mpImage = BitmapImageBuilder(upright).build()
 
-                    // each timestamp has to be greater than the last
                     var currentTimestamp = SystemClock.uptimeMillis()
                     if (currentTimestamp <= lastTimestamp) {
                         currentTimestamp = lastTimestamp + 1
                     }
                     lastTimestamp = currentTimestamp
 
-                    // send the good stamps to the detector
                     landmarker.detectAsync(mpImage, currentTimestamp)
                     objectDetector.detectAsync(mpImage, currentTimestamp)
-
                 } catch (e: Exception) {
                     Log.e("CameraPreview", "Frame processing error", e)
                 } finally {
-                    // close the deliverance of frames
                     proxy.close()
                 }
 
@@ -254,19 +351,37 @@ fun CameraPreview() {
         }, ContextCompat.getMainExecutor(context))
 
         onDispose {
+            cameraProvider?.unbindAll()
             executor.shutdown()
             landmarker.close()
             objectDetector.close()
+            beeper.stop()
+            voice.destroy()
+            speaker.shutdown()
         }
     }
 
+    // ---- Full Screen Touch Handler & UI ----
     Box(
-        Modifier.fillMaxSize().background(Color.Black).statusBarsPadding(),
+        Modifier
+            .fillMaxSize()
+            .background(Color.Black)
+            .statusBarsPadding()
+            .pointerInput(Unit) {
+                detectTapGestures(
+                    onTap = {
+                        targetLabel = null
+                        lockedBox = null
+                        listening = false
+                        hasAnnouncedFound = false // Reset here too
+                        appMode = AppMode.LISTING
+                    }
+                )
+            },
         contentAlignment = Alignment.TopCenter
     ) {
         val bmp = frame
         if (bmp != null) {
-            // Image and overlay share one box with the bitmap's own aspect ratio
             Box(Modifier.fillMaxWidth().aspectRatio(bmp.width.toFloat() / bmp.height)) {
                 Image(
                     bitmap = bmp.asImageBitmap(),
@@ -275,74 +390,42 @@ fun CameraPreview() {
                     contentScale = ContentScale.FillBounds
                 )
                 Canvas(Modifier.fillMaxSize()) {
-                    if (points.size == 21) {
-                        HAND_LINKS.forEach { (a, b) ->
-                            drawLine(
-                                Color.Green,
-                                Offset(points[a].x * size.width, points[a].y * size.height),
-                                Offset(points[b].x * size.width, points[b].y * size.height),
-                                strokeWidth = 6f
-                            )
-                        }
-                        points.forEach { p ->
-                            drawCircle(Color.Red, 10f, Offset(p.x * size.width, p.y * size.height))
-                        }
-                    }
-                    val fingerTip = if (points.size == 21) {
-                        Offset(points[8].x * size.width, points[8].y * size.height)
-                    } else null
-
+                    val pts = points
                     val scaleX = size.width / bmp.width
                     val scaleY = size.height / bmp.height
 
-
-                    // find which obejct is closest to the finger tip
-                    var targetObject: DetectedItem? = null
-                    var minDistince = Float.MAX_VALUE
-
-                    if (fingerTip != null && detectedObjects.isNotEmpty()) {
-                        detectedObjects.forEach { obj ->
-                            val objCenterX = ((obj.boundingBox.left + obj.boundingBox.right) / 2f) * scaleX
-                            val objCenterY = ((obj.boundingBox.top + obj.boundingBox.bottom) / 2f) * scaleY
-
-                            //calculate the distance between objects and fingertips
-                            val dx = fingerTip.x - objCenterX
-                            val dy = fingerTip.y - objCenterY
-                            val distance = kotlin.math.sqrt(dx * dx + dy * dy) //euclidian distance in pixels
-
-                            //set the mindistance to render the closest object
-                            if (distance < minDistince) {
-                                minDistince = distance
-                                targetObject = obj
-                            }
+                    if (pts.size == 21) {
+                        HAND_LINKS.forEach { (a, b) ->
+                            drawLine(
+                                Color.Green,
+                                Offset(pts[a].x * size.width, pts[a].y * size.height),
+                                Offset(pts[b].x * size.width, pts[b].y * size.height),
+                                strokeWidth = 6f
+                            )
+                        }
+                        pts.forEach { p ->
+                            drawCircle(Color.Red, 10f, Offset(p.x * size.width, p.y * size.height))
                         }
                     }
+                    val fingerTip = if (pts.size == 21) {
+                        Offset(pts[8].x * size.width, pts[8].y * size.height)
+                    } else null
 
-
-                    // draw the boxes for objects
                     detectedObjects.forEach { obj ->
-                        // mediapipe objectdetector returns pixel coordinates relative to the upright bitmap size
-                        // scale them to match the canvas size
-                        val scaleX = size.width / bmp.width
-                        val scaleY = size.height / bmp.height
-
-                        //coords for top left
                         val left = obj.boundingBox.left * scaleX
                         val top = obj.boundingBox.top * scaleY
                         val boxWidth = obj.boundingBox.width() * scaleX
                         val boxHeight = obj.boundingBox.height() * scaleY
+                        val isTarget = obj.label == targetLabel && appMode == AppMode.TARGET_RANGE
 
-                        //draw the rectangle inside the bounding box limits
                         drawRect(
-                            color = Color.Yellow,
+                            color = if (isTarget) Color.Cyan else Color.Yellow,
                             topLeft = Offset(left, top),
                             size = Size(boxWidth, boxHeight),
-                            style = Stroke(width = 4f)
+                            style = Stroke(width = if (isTarget) 8f else 4f)
                         )
-                        //label format
-                        val textLabel = "${obj.label} ${(obj.score * 100).toInt()}%"
 
-                        //measure the size of text for background
+                        val textLabel = "${obj.label} ${(obj.score * 100).toInt()}%"
                         val textLayoutResult = textMeasurer.measure(
                             text = textLabel,
                             style = TextStyle(
@@ -351,15 +434,11 @@ fun CameraPreview() {
                                 fontWeight = FontWeight.Bold
                             )
                         )
-
-                        // Position text above the box (or just inside if near top edge of screen)
                         val textY = if (top > textLayoutResult.size.height + 10) {
-                            top - textLayoutResult.size.height - 8
+                            top - textLayoutResult.size.height - 8f
                         } else {
-                            top + 8
+                            top + 8f
                         }
-
-                        // 3. Draw a dark backdrop behind text so it's readable
                         drawRect(
                             color = Color.Black.copy(alpha = 0.75f),
                             topLeft = Offset(left, textY),
@@ -368,28 +447,36 @@ fun CameraPreview() {
                                 height = textLayoutResult.size.height + 8f
                             )
                         )
-
-                        drawText(textLayoutResult = textLayoutResult, topLeft = Offset(left + 8f, textY + 4f))
+                        drawText(
+                            textLayoutResult = textLayoutResult,
+                            topLeft = Offset(left + 8f, textY + 4f)
+                        )
                     }
 
-                    //draw a tracking line from the index finger to the target object
-                    if (fingerTip != null && targetObject != null) {
-                        val target = targetObject
-                        val targetCenterX = ((target.boundingBox.left + target.boundingBox.right) / 2f) * scaleX
-                        val targetCenterY = ((target.boundingBox.top + target.boundingBox.bottom) / 2f) * scaleY
-
-                        drawLine(color=Color.Magenta, start=fingerTip, end= Offset(targetCenterX, targetCenterY), strokeWidth = 4f)
+                    val target = lockedBox
+                    if (fingerTip != null && target != null && appMode == AppMode.TARGET_RANGE) {
+                        val cx = ((target.left + target.right) / 2f) * scaleX
+                        val cy = ((target.top + target.bottom) / 2f) * scaleY
+                        drawLine(
+                            color = Color.Magenta,
+                            start = fingerTip,
+                            end = Offset(cx, cy),
+                            strokeWidth = 4f
+                        )
                     }
                 }
             }
         }
+
+        // Diagnostic Text Display
         Text(
-            "FPS: $fps",
+            "FPS: $fps   |   $lastSpoken",
             color = Color.White,
             modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .navigationBarsPadding()
+                .align(Alignment.TopStart)
                 .padding(16.dp)
+                .background(Color.Black.copy(alpha = 0.6f))
+                .padding(8.dp)
         )
     }
 }
