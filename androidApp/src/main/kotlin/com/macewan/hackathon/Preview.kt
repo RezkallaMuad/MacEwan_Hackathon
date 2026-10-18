@@ -458,8 +458,12 @@ fun CameraPreview() {
                             drawCircle(Color.Red, 10f, Offset(p.x * size.width, p.y * size.height))
                         }
                     }
-                    val fingerTip = if (pts.size == 21) {
-                        Offset(pts[8].x * size.width, pts[8].y * size.height)
+                    val fingerTip = if (pts.size == 21 && lockedBox != null) {
+                        val t = lockedBox!!
+                        val cx = ((t.left + t.right) / 2f) * scaleX
+                        val cy = ((t.top + t.bottom) / 2f) * scaleY
+                        pts.map { Offset(it.x * size.width, it.y * size.height) }
+                            .minByOrNull { hypot(it.x - cx, it.y - cy) }
                     } else null
 
                     detectedObjects.forEach { obj ->
