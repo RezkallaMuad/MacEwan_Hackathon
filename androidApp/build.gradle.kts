@@ -17,6 +17,8 @@ dependencies {
     implementation("androidx.camera:camera-lifecycle:1.4.2")
     implementation("androidx.camera:camera-view:1.4.2")
     implementation("com.google.mediapipe:tasks-vision:0.10.21")
+    implementation("org.tensorflow:tensorflow-lite:2.16.1")
+    implementation("org.tensorflow:tensorflow-lite-gpu:2.16.1")
     implementation(libs.compose.ui)
     implementation(libs.compose.foundation)
     implementation(libs.compose.material3)
@@ -27,6 +29,9 @@ dependencies {
 }
 
 android {
+    androidResources {
+        noCompress += "tflite"
+    }
     namespace = "com.macewan.hackathon"
     compileSdk = libs.versions.android.compileSdk.get().toInt()
 

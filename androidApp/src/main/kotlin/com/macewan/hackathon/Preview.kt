@@ -63,6 +63,7 @@ import kotlinx.coroutines.delay
 import androidx.camera.core.Camera
 import android.speech.tts.TextToSpeech
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicBoolean
 
 enum class AppMode {
     IDLE, LISTING, TARGET_RANGE
@@ -108,7 +109,7 @@ private fun createLandmarker(context: Context, onResult: (List<Offset>) -> Unit)
 
 data class DetectedItem(val label: String, val score: Float, val boundingBox: RectF)
 val IGNORED_LABELS = setOf("person", "dining table")
-private fun createObjectDetector(context: Context, onResult: (List<DetectedItem>) -> Unit): ObjectDetector {
+/*private fun createObjectDetector(context: Context, onResult: (List<DetectedItem>) -> Unit): ObjectDetector {
     val base = BaseOptions.builder()
         .setModelAssetPath("efficientdet_lite0.tflite")
         .build()
@@ -139,6 +140,7 @@ private fun createObjectDetector(context: Context, onResult: (List<DetectedItem>
 
     return ObjectDetector.createFromOptions(context, options)
 }
+*/
 
 private val HAND_LINKS = listOf(
     0 to 1, 1 to 2, 2 to 3, 3 to 4,
@@ -166,7 +168,9 @@ fun CameraPreview() {
     var tts by remember { mutableStateOf<TextToSpeech?>(null) }
 
     var detectedObjects by remember { mutableStateOf<List<DetectedItem>>(emptyList()) }
-    val objectDetector = remember { createObjectDetector(context) { detectedObjects = it } }
+    val yolo = remember { YoloDetector(context) }
+    val yoloExecutor = remember { Executors.newSingleThreadExecutor() }
+    val yoloBusy = remember { AtomicBoolean(false) }
 
     val executor = remember { Executors.newSingleThreadExecutor() }
     val landmarker = remember { createLandmarker(context) { points = it } }
@@ -360,7 +364,17 @@ fun CameraPreview() {
                     lastTimestamp = currentTimestamp
 
                     landmarker.detectAsync(mpImage, currentTimestamp)
-                    objectDetector.detectAsync(mpImage, currentTimestamp)
+                    if (yoloBusy.compareAndSet(false, true)) {
+                        yoloExecutor.execute {
+                            try {
+                                detectedObjects = yolo.detect(upright)
+                            } catch (e: Exception) {
+                                Log.e("Yolo", "Detection error", e)
+                            } finally {
+                                yoloBusy.set(false)
+                            }
+                        }
+                    }
                 } catch (e: Exception) {
                     Log.e("CameraPreview", "Frame processing error", e)
                 } finally {
@@ -384,7 +398,8 @@ fun CameraPreview() {
             cameraProvider?.unbindAll()
             executor.shutdown()
             landmarker.close()
-            objectDetector.close()
+            yoloExecutor.execute { yolo.close() }
+            yoloExecutor.shutdown()
             beeper.stop()
             voice.destroy()
             speaker.shutdown()
