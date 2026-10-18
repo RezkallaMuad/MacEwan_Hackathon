@@ -175,7 +175,10 @@ fun CameraPreview() {
     val beeper = remember { ProximityBeeper() }
     LaunchedEffect(Unit) { beeper.start(this) }
     val speaker = remember { Speaker(context) }
-
+    rememberShakeDetector(enabled = true) {
+        isTorchOn = !isTorchOn
+        speaker.say(if (isTorchOn) "Flashlight on" else "Flashlight off")
+    }
     // --- State for Tap-Driven Flow ---
     var appMode by remember { mutableStateOf(AppMode.IDLE) }
     var scanning by remember { mutableStateOf(false) }
@@ -199,6 +202,12 @@ fun CameraPreview() {
         ActivityResultContracts.RequestPermission()
     ) { micOk = it }
 
+    LaunchedEffect(camera, isTorchOn) {
+        val cam = camera ?: return@LaunchedEffect
+        if (cam.cameraInfo.hasFlashUnit()) {
+            cam.cameraControl.enableTorch(isTorchOn)
+        }
+    }
     LaunchedEffect(Unit) {
         if (!micOk) micLauncher.launch(Manifest.permission.RECORD_AUDIO)
 
@@ -222,12 +231,12 @@ fun CameraPreview() {
                 hasAnnouncedFound = false // Reset the announcement tracker
                 speaker.say("Looking for $label.")
                 lastSpoken = "Target: $label"
-            } /*else {
+            } else {
                 speaker.say("I didn't catch that. Tap the screen to scan again.")
                 appMode = AppMode.IDLE
                 lastSpoken = "Voice failed. Tap to retry."
             }
-            */
+
         }
     }
 
@@ -307,11 +316,10 @@ fun CameraPreview() {
         if (pts.size == 21 && box != null) {
             val fx = pts[8].x * bmp.width
             val fy = pts[8].y * bmp.height
-            val dx = maxOf(box.left - fx, 0f, fx - box.right)
-            val dy = maxOf(box.top - fy, 0f, fy - box.bottom)
-            result = (hypot(dx, dy) / (bmp.width * 0.5f)).coerceIn(0f, 1f)
-
-            // teammate's tilt/buzz code can go here
+            val cx = (box.left + box.right) / 2f
+            val cy = (box.top + box.bottom) / 2f
+            val maxDist = hypot(bmp.width.toFloat(), bmp.height.toFloat()) * 0.5f
+            result = (hypot(fx - cx, fy - cy) / maxDist).coerceIn(0f, 1f)
         }
         beeper.distance = result
     }
@@ -369,7 +377,7 @@ fun CameraPreview() {
             }
 
             provider.unbindAll()
-            provider.bindToLifecycle(lifecycleOwner, CameraSelector.DEFAULT_BACK_CAMERA, analysis)
+            camera = provider.bindToLifecycle(lifecycleOwner, CameraSelector.DEFAULT_BACK_CAMERA, analysis)
         }, ContextCompat.getMainExecutor(context))
 
         onDispose {
