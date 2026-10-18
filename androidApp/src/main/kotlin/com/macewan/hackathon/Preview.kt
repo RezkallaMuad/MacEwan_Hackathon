@@ -318,12 +318,18 @@ fun CameraPreview() {
         var result: Float? = null
 
         if (pts.size == 21 && box != null) {
-            val fx = pts[8].x * bmp.width
-            val fy = pts[8].y * bmp.height
             val cx = (box.left + box.right) / 2f
             val cy = (box.top + box.bottom) / 2f
             val maxDist = hypot(bmp.width.toFloat(), bmp.height.toFloat()) * 0.5f
-            result = (hypot(fx - cx, fy - cy) / maxDist).coerceIn(0f, 1f)
+
+            var best = Float.MAX_VALUE
+            for (p in pts) {
+                val px = p.x * bmp.width
+                val py = p.y * bmp.height
+                val d = hypot(px - cx, py - cy)
+                if (d < best) best = d
+            }
+            result = (best / maxDist).coerceIn(0f, 1f)
         }
         beeper.distance = result
     }
