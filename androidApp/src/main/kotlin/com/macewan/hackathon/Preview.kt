@@ -6,14 +6,15 @@ import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Matrix
 import android.graphics.RectF
+import android.hardware.camera2.CameraCharacteristics
 import android.os.SystemClock
 import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import android.hardware.camera2.CameraCharacteristics
 import androidx.camera.camera2.interop.Camera2CameraInfo
 import androidx.camera.camera2.interop.ExperimentalCamera2Interop
+import androidx.camera.core.Camera
 import androidx.camera.core.CameraInfo
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
@@ -23,14 +24,14 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBarsPadding
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Text
@@ -66,22 +67,18 @@ import com.google.mediapipe.framework.image.BitmapImageBuilder
 import com.google.mediapipe.tasks.core.BaseOptions
 import com.google.mediapipe.tasks.vision.core.RunningMode
 import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarker
-import com.google.mediapipe.tasks.vision.objectdetector.ObjectDetector
-import com.google.mediapipe.tasks.vision.objectdetector.ObjectDetectorResult
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
-import kotlin.math.hypot
-import kotlinx.coroutines.delay
-import androidx.camera.core.Camera
-import android.speech.tts.TextToSpeech
-import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
-import java.util.concurrent.ExecutorService
+import kotlin.math.hypot
+import kotlinx.coroutines.delay
 
 enum class AppMode {
     IDLE, LISTING, TARGET_RANGE
 }
 
+//root entry composable that checks for runtime camera permissions before rendering the camera feed
 @Composable
 fun CameraScreen() {
     val context = LocalContext.current
@@ -99,12 +96,13 @@ fun CameraScreen() {
         CameraPreview()
     } else {
         Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            Text("Camera permission needed")
+            Text("Camera permission needed", color = Color.White)
         }
         LaunchedEffect(Unit) { launcher.launch(Manifest.permission.CAMERA) }
     }
 }
 
+//factory for mediapipe hand landmarker, configured in LIVE_STREAM mode (runs async on background thread so camera doesnt stutter)
 private fun createLandmarker(context: Context, onResult: (List<Offset>, Long) -> Unit): HandLandmarker {
     val base = BaseOptions.builder().setModelAssetPath("hand_landmarker.task").build()
     val options = HandLandmarker.HandLandmarkerOptions.builder()
@@ -113,6 +111,7 @@ private fun createLandmarker(context: Context, onResult: (List<Offset>, Long) ->
         .setNumHands(1)
         .setResultListener { result, _ ->
             val hand = result.landmarks().firstOrNull()
+            //map the 3d media pipe landmarker to the 2d normalized offsets on screen
             onResult(hand?.map { Offset(it.x(), it.y()) } ?: emptyList(), result.timestampMs())
         }
         .setErrorListener { e -> Log.e("HandTracker", "MediaPipe error", e) }
@@ -120,7 +119,7 @@ private fun createLandmarker(context: Context, onResult: (List<Offset>, Long) ->
     return HandLandmarker.createFromOptions(context, options)
 }
 
-/** Horizontal field of view in degrees, from the lens focal length and sensor size. */
+//find the Horz. fov in degrees using camera2 | used automatically to pick the widest lens
 @androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
 private fun horizontalFovDegrees(info: CameraInfo): Float? = try {
     val c2 = Camera2CameraInfo.from(info)
@@ -134,67 +133,56 @@ private fun horizontalFovDegrees(info: CameraInfo): Float? = try {
 private fun cameraIdOf(info: CameraInfo): String =
     try { Camera2CameraInfo.from(info).cameraId } catch (e: Exception) { "?" }
 
-/** A loaded YOLO detector and the thread it must run on. */
+//thread safe container pairing a loaded YOLO network with its dedicated worker thread
 private class YoloSlot(val det: YoloDetector, val exec: ExecutorService)
 
+//unified representation of oject YOLO
 data class DetectedItem(val label: String, val score: Float, val boundingBox: RectF)
 val IGNORED_LABELS = setOf("person", "dining table")
 
-// Wrist + finger bases: solid, interior parts of the hand, so depth there isn't mixed with background.
 private val PALM_LANDMARKS = listOf(0, 1, 5, 9, 13, 17)
-
-/** Max age gap (ms) between the depth map's frame and the hand landmarks' frame. Tune. */
-private const val DEPTH_MAX_SKEW_MS = 200L
-/** How strongly the depth gap counts against the 2D gap. Tune. */
+private const val DEPTH_MAX_SKEW_MS = 250L
 private const val DEPTH_WEIGHT = 0.6f
-/** Number of recent distance readings the median filter looks at. */
-private const val DISTANCE_MEDIAN_WINDOW = 5
+private const val DISTANCE_MEDIAN_WINDOW = 3
 
-/**
- * Horizontal position in the frame (0 = left edge, 1 = right edge) -> top half of a clock:
- * left edge = 9, center = 12, right edge = 3. The user infers orientation from their grip.
- */
 fun clockHour(nx: Float): Int {
-    val h = 9 + Math.round(nx.coerceIn(0f, 1f) * 6f)   // 9..15
+    val h = 9 + Math.round(nx.coerceIn(0f, 1f) * 6f)
     return if (h > 12) h - 12 else h
 }
 
-/** One physical item followed across the listing scan (so two cups stay two cups). */
+//tracks an obj across multple frames during the scan and prevents duplicates
 private class ListingTrack(val label: String, var x: Float, var y: Float) {
     val xs = mutableListOf<Float>()
     val colors = mutableListOf<String>()
     var hits = 0
-    /** Color seen in at least 40% of samples, else null (too unsure to say). */
-    fun color(): String? {
+    fun color(): String? { //returns the dominant color >= 40% of frames
         val best = colors.groupingBy { it }.eachCount().maxByOrNull { it.value } ?: return null
         return if (best.value >= colors.size * 0.4f) best.key else null
     }
 }
 
-/**
- * Which detection of the target label to follow: the right color if one was asked for,
- * and otherwise the one nearest the box already locked (so it doesn't hop between two cups).
- */
+//selects which box is the active target, matches requested color and locks onto candidate nearest to prev locked box to avoid hopping between 2
 private fun pickTarget(cands: List<DetectedItem>, color: String?, prev: RectF?, bmp: Bitmap): DetectedItem? {
     if (cands.isEmpty()) return null
     var pool = cands
     if (color != null) {
         val byColor = cands.filter { dominantColor(bmp, it.boundingBox) == color }
         if (byColor.isNotEmpty()) pool = byColor
-        else if (prev == null) return null   // don't lock onto the wrong-colored one
+        else if (prev == null) return null
     }
     return if (prev != null) {
-        pool.minBy { hypot(it.boundingBox.centerX() - prev.centerX(), it.boundingBox.centerY() - prev.centerY()) }
-    } else pool.maxBy { it.score }
+        pool.minByOrNull { hypot(it.boundingBox.centerX() - prev.centerX(), it.boundingBox.centerY() - prev.centerY()) }
+    } else pool.maxByOrNull { it.score }
 }
 
+//utility for median of a float collection
 private fun median(values: List<Float>): Float? {
     if (values.isEmpty()) return null
     val s = values.sorted()
     return if (s.size % 2 == 1) s[s.size / 2] else (s[s.size / 2 - 1] + s[s.size / 2]) / 2f
 }
 
-/** Per-session filter state for the hand-to-target distance. */
+//session state tracking hand to object depth differential
 private class ProximityState {
     var objDepth: Float? = null
     var dDepth = 0f
@@ -203,6 +191,7 @@ private class ProximityState {
     fun reset() { objDepth = null; dDepthAt = 0L; history.clear() }
 }
 
+//points on hand
 private val HAND_LINKS = listOf(
     0 to 1, 1 to 2, 2 to 3, 3 to 4,
     0 to 5, 5 to 6, 6 to 7, 7 to 8,
@@ -215,24 +204,23 @@ private val HAND_LINKS = listOf(
 fun CameraPreview() {
     val context = LocalContext.current
     val lifecycleOwner = context as ComponentActivity
-    val alignment = rememberCameraAlignment()   // teammate's tilt code
 
+    val alignment = rememberCameraAlignment()//phone tilt sensor
+
+    //hand tracking state
     var points by remember { mutableStateOf<List<Offset>>(emptyList()) }
     var pointsTime by remember { mutableLongStateOf(0L) }
     val prox = remember { ProximityState() }
     var frame by remember { mutableStateOf<Bitmap?>(null) }
     var fps by remember { mutableIntStateOf(0) }
 
-    // camera and torch states
+    //flashlight state
     var camera by remember { mutableStateOf<Camera?>(null) }
     var isTorchOn by remember { mutableStateOf(false) }
 
-    // tts
-    var tts by remember { mutableStateOf<TextToSpeech?>(null) }
+    var detectedObjects by remember { mutableStateOf<List<DetectedItem>>(emptyList()) } //detected objects state
 
-    var detectedObjects by remember { mutableStateOf<List<DetectedItem>>(emptyList()) }
-    // Models load in the background (GPU setup can take many seconds) on the same
-    // thread that later runs them. Null until loaded.
+    //YOLO stuff (model threading)
     val yoloRef = remember { AtomicReference<YoloSlot?>(null) }
     val yoloGpuExecutor = remember { Executors.newSingleThreadExecutor() }
     val yoloExecutor = remember { Executors.newSingleThreadExecutor() }
@@ -240,59 +228,67 @@ fun CameraPreview() {
     val depthRef = remember { AtomicReference<DepthEstimator?>(null) }
     val depthExecutor = remember { Executors.newSingleThreadExecutor() }
     val depthBusy = remember { AtomicBoolean(false) }
-    // Set when each model finishes loading (or fails to load), for the loading indicator.
+
     var yoloReady by remember { mutableStateOf(false) }
     var depthReady by remember { mutableStateOf(false) }
-    // Only YOLO is needed to start; MiDaS (depth) finishes loading in the background.
     val modelsReady = yoloReady
+
+    //background model launcher
     LaunchedEffect(Unit) {
-        // 1) CPU YOLO: loads in seconds so the app is usable right away.
         yoloExecutor.execute {
             val t = SystemClock.uptimeMillis()
             try {
                 val cpu = YoloDetector(context, useGpu = false)
-                // If the GPU version already won the race (cache hit), don't replace it.
                 if (!yoloRef.compareAndSet(null, YoloSlot(cpu, yoloExecutor))) cpu.close()
             } catch (e: Throwable) { Log.e("Yolo", "CPU load failed", e) }
             finally { yoloReady = true }
             Log.d("Yolo", "CPU loaded in ${SystemClock.uptimeMillis() - t}ms")
         }
-        // 2) GPU YOLO: compiles in the background (fast if cached), then takes over.
+
+        //yolo
         yoloGpuExecutor.execute {
             val t = SystemClock.uptimeMillis()
             try {
                 val g = YoloDetector(context)
                 if (g.usingGpu) {
                     val old = yoloRef.getAndSet(YoloSlot(g, yoloGpuExecutor))
-                    // Close the CPU one on its own thread, after any detection in progress.
                     old?.let { o -> o.exec.execute { o.det.close() } }
                     yoloReady = true
                 } else g.close()
             } catch (e: Throwable) { Log.e("Yolo", "GPU load failed", e) }
             Log.d("Yolo", "GPU loaded in ${SystemClock.uptimeMillis() - t}ms")
         }
+
+        // midas depth sensor
         depthExecutor.execute {
             val t = SystemClock.uptimeMillis()
             try { depthRef.set(DepthEstimator(context)) } catch (e: Throwable) { Log.e("Depth", "load failed", e) }
             finally { depthReady = true }
             Log.d("Depth", "loaded in ${SystemClock.uptimeMillis() - t}ms")
         }
+
+
     }
+
     val executor = remember { Executors.newSingleThreadExecutor() }
     val landmarker = remember {
         createLandmarker(context) { p, t -> pointsTime = t; points = p }
     }
     val textMeasurer = rememberTextMeasurer()
 
+    //audio
     val beeper = remember { ProximityBeeper() }
     LaunchedEffect(Unit) { beeper.start(this) }
     val chime = remember { Chime() }
     val speaker = remember { Speaker(context) }
+
+    //shake gesture
     rememberShakeDetector(enabled = true) {
         isTorchOn = !isTorchOn
         speaker.say(if (isTorchOn) "Flashlight on" else "Flashlight off")
     }
-    // --- State for Tap-Driven Flow ---
+
+    // App state
     var appMode by remember { mutableStateOf(AppMode.IDLE) }
     var isForeground by remember { mutableStateOf(true) }
     var debugText by remember { mutableStateOf("") }
@@ -303,11 +299,9 @@ fun CameraPreview() {
     var lockedBox by remember { mutableStateOf<RectF?>(null) }
     var lockedAt by remember { mutableLongStateOf(0L) }
     var lastSpoken by remember { mutableStateOf("Tap screen to list items") }
-
-    // NEW: Track if we've already announced finding the target so it doesn't spam the speaker
     var hasAnnouncedFound by remember { mutableStateOf(false) }
 
-    // --- Voice Setup ---
+    //mic perms
     var micOk by remember {
         mutableStateOf(
             ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
@@ -318,18 +312,20 @@ fun CameraPreview() {
         ActivityResultContracts.RequestPermission()
     ) { micOk = it }
 
+    //sync torch to statechanges
     LaunchedEffect(camera, isTorchOn) {
         val cam = camera ?: return@LaunchedEffect
         if (cam.cameraInfo.hasFlashUnit()) {
             cam.cameraControl.enableTorch(isTorchOn)
         }
     }
+
+    //initial audio boot up
     LaunchedEffect(Unit) {
         if (!micOk) micLauncher.launch(Manifest.permission.RECORD_AUDIO)
 
-        delay(1000)
+        delay(800)
         if (!yoloReady) {
-            // Usually ready in a few seconds (CPU YOLO), so stay quiet unless it drags on.
             var waited = 0L
             var announced = false
             while (!yoloReady) {
@@ -339,24 +335,30 @@ fun CameraPreview() {
                     speaker.say("Loading, please wait.")
                     announced = true
                 }
-                // Soft chime every 4 seconds after that so it doesn't seem frozen
                 if (waited > 3_000 && waited % 4_000 == 0L && isForeground) chime.pending()
             }
             if (isForeground) chime.ready()
-            delay(900) // let the tune finish before speaking
+            delay(900)
             speaker.say("Ready. Tap to scan.")
         } else {
             speaker.say("Tap to scan.")
         }
 
-        while (true) {
-            delay(10_000)
-            if (isForeground && appMode == AppMode.IDLE && targetLabel == null) {
-                speaker.say("Tap to scan.")
-            }
-        }
     }
+//    // voice looping when idle
+//    LaunchedEffect(appMode) {
+//        // only run when idle and ready
+//        if (appMode == AppMode.IDLE) {
+//            while (true) {
+//                delay(12_000L) // wait 12 secs
+//                if (isForeground && appMode == AppMode.IDLE && targetLabel == null && yoloReady) {
+//                    speaker.say("Tap to scan.")
+//                }
+//            }
+//        }
+//    }
 
+    //voice recognition callback - fires when user selects target
     val voice = remember {
         VoiceTarget(context) { label, color ->
             listening = false
@@ -364,7 +366,7 @@ fun CameraPreview() {
                 targetLabel = label
                 targetColor = color
                 appMode = AppMode.TARGET_RANGE
-                hasAnnouncedFound = false // Reset the announcement tracker
+                hasAnnouncedFound = false
                 val name = listOfNotNull(color, label).joinToString(" ")
                 speaker.say("Finding $name.")
                 lastSpoken = "Target: $name"
@@ -373,11 +375,10 @@ fun CameraPreview() {
                 appMode = AppMode.IDLE
                 lastSpoken = "Voice failed. Tap to retry."
             }
-
         }
     }
 
-    // ---- Go quiet when the screen turns off / app goes to background ----
+    //mutes audio and stops interface when in background
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             when (event) {
@@ -403,7 +404,7 @@ fun CameraPreview() {
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
-    // ---- Mode 1: Listing Mode (Triggered by Tap) ----
+    // ---- Mode 1: Listing Mode ----
     LaunchedEffect(appMode) {
         if (appMode == AppMode.LISTING) {
             beeper.distance = null
@@ -412,10 +413,8 @@ fun CameraPreview() {
             hasAnnouncedFound = false
             lastSpoken = "Scanning..."
 
-            // Follow each physical item across samples by label + position, so
-            // multiple items of the same kind are reported separately.
             val tracks = mutableListOf<ListingTrack>()
-            val samples = 20
+            val samples = 15 // reduced from 20 to speed up responsiveness (1.5s total)
             repeat(samples) {
                 val f = frame
                 if (f != null && f.width > 0 && f.height > 0) {
@@ -426,7 +425,7 @@ fun CameraPreview() {
                         val ny = d.boundingBox.centerY() / fh
                         val t = tracks
                             .filter { it.label == d.label && it !in used &&
-                                    kotlin.math.abs(it.x - nx) < 0.1f && kotlin.math.abs(it.y - ny) < 0.15f }
+                                    kotlin.math.abs(it.x - nx) < 0.12f && kotlin.math.abs(it.y - ny) < 0.18f }
                             .minByOrNull { kotlin.math.abs(it.x - nx) + kotlin.math.abs(it.y - ny) }
                             ?: ListingTrack(d.label, nx, ny).also { tracks.add(it) }
                         used.add(t)
@@ -441,8 +440,8 @@ fun CameraPreview() {
             }
             scanning = false
 
-            // Items seen consistently, ordered left (9 o'clock) to right (3 o'clock)
-            val parts = tracks.filter { it.hits >= samples * 0.3 }
+            //order items from left to right 9 to 3
+            val parts = tracks.filter { it.hits >= samples * 0.25 }
                 .sortedBy { median(it.xs) ?: 0.5f }
                 .map { t ->
                     val name = listOfNotNull(t.color(), t.label).joinToString(" ")
@@ -450,12 +449,13 @@ fun CameraPreview() {
                 }
 
             if (parts.isNotEmpty()) {
-                val msg = parts.joinToString(". ") + ". Which one?"
+                val msg = parts.joinToString(". ") + ". Select item."
                 speaker.say(msg)
                 lastSpoken = parts.joinToString(". ")
 
-                delay((msg.length * 80L) + 1000L)
+                delay((msg.length * 75L) + 800L)
 
+                //prompt user choice
                 if (micOk && appMode == AppMode.LISTING) {
                     listening = true
                     lastSpoken = "Listening for your choice..."
@@ -483,7 +483,7 @@ fun CameraPreview() {
         val now = SystemClock.uptimeMillis()
         val w = bmp.width.toFloat(); val h = bmp.height.toFloat()
 
-        // Padded hand bounding box in pixels, used to tell when the hand covers the target.
+        //calculate hand bounding box
         val handBox: RectF? = if (pts.size == 21) {
             val pad = 0.04f * w
             RectF(
@@ -491,40 +491,38 @@ fun CameraPreview() {
                 pts.maxOf { it.x } * w + pad, pts.maxOf { it.y } * h + pad
             )
         } else null
+        //detect occlusion - check if the hand covers the object
         val handOverLocked = lockedBox?.let { lb -> handBox != null && RectF.intersects(lb, handBox) } ?: false
 
+        //match candidate boxes
         val match = pickTarget(detectedObjects.filter { it.label == targetLabel }, targetColor, lockedBox, bmp)
         if (match != null) {
-            // While the hand covers the target, YOLO's box shrinks and shifts with the
-            // occlusion. Keep the last clean box instead of following it.
             if (lockedBox == null || !handOverLocked) lockedBox = match.boundingBox
-            lockedAt = now
+            lockedAt = now //keep lock even if hand covers object from YOLO sight
 
-            // NEW: If we just found it and haven't announced it yet, say it!
             if (!hasAnnouncedFound) {
                 val name = listOfNotNull(targetColor, targetLabel).joinToString(" ")
                 speaker.say("$name, ${clockHour(match.boundingBox.centerX() / bmp.width)} o'clock.")
                 hasAnnouncedFound = true
             }
-
         } else if (handOverLocked) {
-            // Hand is hiding the object from YOLO; keep the lock alive.
             lockedAt = now
         } else if (now - lockedAt > 3000) {
             lockedBox = null
             prox.reset()
-            // NEW: Reset if the object is out of view for 3 seconds so it will announce again when refound
             hasAnnouncedFound = false
         }
 
         val box = lockedBox
         var result: Float? = null
 
+        //compute 2d euclidean distance and 3d depth
         if (pts.size == 21 && box != null) {
             val cx = (box.left + box.right) / 2f
             val cy = (box.top + box.bottom) / 2f
             val maxDist = hypot(bmp.width.toFloat(), bmp.height.toFloat()) * 0.5f
 
+            //find closest hand point to object center
             var best = Float.MAX_VALUE
             for (p in pts) {
                 val d = hypot(p.x * bmp.width - cx, p.y * bmp.height - cy)
@@ -532,16 +530,12 @@ fun CameraPreview() {
             }
             val d2d = (best / maxDist).coerceIn(0f, 1f)
 
-            // Only trust the depth map if it came from (nearly) the same camera frame
-            // as the hand landmarks; otherwise the hand has moved and we'd sample background.
             val dep = depthRef.get()
             val df = dep?.frame
             if (dep != null && df != null && kotlin.math.abs(df.timestampMs - pointsTime) <= DEPTH_MAX_SKEW_MS) {
-                // Hand depth: median over palm landmarks (not a single fingertip on the hand's edge).
                 val handDepth = median(PALM_LANDMARKS.mapNotNull { dep.depthAt(pts[it].x, pts[it].y, df) })
 
-                // Object depth: 3x3 grid inside the box, skipping points the hand covers.
-                // If the hand covers all of them, keep the last clean reading.
+                //smaple grid box
                 val objSamples = ArrayList<Float>(9)
                 for (fy in floatArrayOf(0.2f, 0.5f, 0.8f)) for (fx in floatArrayOf(0.2f, 0.5f, 0.8f)) {
                     val px = box.left + fx * box.width()
@@ -554,14 +548,12 @@ fun CameraPreview() {
                 val objDepth = prox.objDepth
                 if (handDepth != null && objDepth != null) {
                     val gap = kotlin.math.abs(handDepth - objDepth)
-                    // Smooth the depth gap itself; it's the noisiest input.
                     prox.dDepth = if (prox.dDepthAt == 0L) gap else prox.dDepth + (gap - prox.dDepth) * 0.3f
                     prox.dDepthAt = now
                 }
             }
 
-            // Keep using the last depth gap for a while when this update has no fresh depth,
-            // instead of flipping between "with depth" and "2D only" (which jumps the value).
+            //combine 2d distance and 3d depth into a distance metric
             val useDepth = prox.dDepthAt != 0L && now - prox.dDepthAt <= 2000
             result = if (useDepth) {
                 hypot(d2d, DEPTH_WEIGHT * prox.dDepth).coerceIn(0f, 1f)
@@ -578,7 +570,7 @@ fun CameraPreview() {
             )
         }
 
-        // Median filter: drop single-frame spikes before the beeper's smoothing.
+        //pass distance to proximity beeper through the median filter
         if (result == null) {
             prox.history.clear()
             beeper.distance = null
@@ -600,16 +592,18 @@ fun CameraPreview() {
             cameraProvider = provider
 
             val analysis = ImageAnalysis.Builder()
-                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST) //drop old frames
                 .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
                 .build()
 
             var frames = 0
             var windowStart = SystemClock.uptimeMillis()
 
+            //analyzer callback for each live frame
             analysis.setAnalyzer(executor) { proxy ->
                 try {
                     val raw = proxy.toBitmap()
+                    //rotate bitmap to match portrait orientation
                     val matrix = Matrix().apply {
                         postRotate(proxy.imageInfo.rotationDegrees.toFloat())
                     }
@@ -625,12 +619,19 @@ fun CameraPreview() {
                     lastTimestamp = currentTimestamp
                     val frameTs = currentTimestamp
 
+                    //run hand landmarking
                     landmarker.detectAsync(mpImage, currentTimestamp)
+
+                    // Execute YOLO and filter out unwanted labels (person, table)
                     val slot = yoloRef.get()
                     if (slot != null && yoloBusy.compareAndSet(false, true)) {
                         slot.exec.execute {
                             try {
-                                detectedObjects = slot.det.detect(upright)
+                                val rawDetections = slot.det.detect(upright)
+                                // filter out persons and tables
+                                detectedObjects = rawDetections.filter {
+                                    it.label.lowercase() !in IGNORED_LABELS
+                                }
                             } catch (e: Exception) {
                                 Log.e("Yolo", "Detection error", e)
                             } finally {
@@ -638,6 +639,8 @@ fun CameraPreview() {
                             }
                         }
                     }
+
+                    //run midas depth estimate (async on worker thread)
                     if (depthBusy.compareAndSet(false, true)) {
                         depthExecutor.execute {
                             try { depthRef.get()?.estimate(upright, frameTs) }
@@ -648,8 +651,10 @@ fun CameraPreview() {
                 } catch (e: Exception) {
                     Log.e("CameraPreview", "Frame processing error", e)
                 } finally {
-                    proxy.close()
+                    proxy.close() //stop camera streaming
                 }
+
+                //fps counter
                 frames++
                 val now = SystemClock.uptimeMillis()
                 if (now - windowStart >= 1000) {
@@ -660,48 +665,30 @@ fun CameraPreview() {
             }
             provider.unbindAll()
 
-            // 1. Build a custom selector that hunts for the widest lens available
-            // 1. Build a custom selector that hunts for the widest lens available
+            //dynamic lens selection
             val wideCameraSelector = CameraSelector.Builder()
                 .requireLensFacing(CameraSelector.LENS_FACING_BACK)
                 .addCameraFilter { cameraInfos ->
-                    Log.d("CameraLenses", "Total back cameras found by CameraX: ${cameraInfos.size}")
-
-                    cameraInfos.forEach { info ->
-                        val minZoom = info.zoomState.value?.minZoomRatio ?: "Unknown"
-                        val maxZoom = info.zoomState.value?.maxZoomRatio ?: "Unknown"
-                        Log.d("CameraLenses", "Camera ${cameraIdOf(info)} -> FOV: ${horizontalFovDegrees(info)} deg, minZoom: $minZoom, maxZoom: $maxZoom")
-                    }
-
-                    // Pick the lens with the widest field of view (the ultra-wide, if the
-                    // phone exposes it as its own camera). Zoom ratio can't tell these apart,
-                    // since every separate camera reports 1.0x as its minimum.
                     val widestCamera = cameraInfos.maxByOrNull { info ->
                         val fov = horizontalFovDegrees(info) ?: 0f
-                        // Tie-break: a lower min zoom (e.g. 0.5x on a logical multi-camera) is wider.
                         fov / (info.zoomState.value?.minZoomRatio ?: 1f)
                     }
-
-                    Log.d("CameraLenses", "Selected camera ${widestCamera?.let { cameraIdOf(it) }} (FOV ${widestCamera?.let { horizontalFovDegrees(it) }} deg)")
-
                     listOfNotNull(widestCamera ?: cameraInfos.firstOrNull())
                 }
                 .build()
 
-            // 2. Bind using our custom wide selector instead of the default
+
             val boundCamera = provider.bindToLifecycle(lifecycleOwner, wideCameraSelector, analysis)
             camera = boundCamera
-
-            // 3. Use the widest zoom the camera supports (e.g. 0.5x on phones with an
-            //    ultra-wide). Re-applied whenever zoom drifts, e.g. after screen off/on.
+            //zoom out to min
             boundCamera.cameraInfo.zoomState.observe(lifecycleOwner) { z ->
                 if (z.zoomRatio > z.minZoomRatio + 0.01f) {
-                    Log.d("CameraLenses", "Zoom range ${z.minZoomRatio}x-${z.maxZoomRatio}x, setting ${z.minZoomRatio}x")
                     boundCamera.cameraControl.setZoomRatio(z.minZoomRatio)
                 }
             }
         }, ContextCompat.getMainExecutor(context))
 
+        //clean it up on disposal
         onDispose {
             cameraProvider?.unbindAll()
             executor.shutdown()
@@ -724,19 +711,60 @@ fun CameraPreview() {
             .fillMaxSize()
             .background(Color.Black)
             .statusBarsPadding()
-            .pointerInput(Unit) {
+            //global screen tapping handler
+            .pointerInput(modelsReady, appMode) {
                 detectTapGestures(
-                    onTap = onTap@{
-                        if (!(yoloReady)) {
+                    onTap = {
+                        if (!modelsReady) {
                             chime.pending()
-                            return@onTap
+                            return@detectTapGestures
                         }
+
+                        if (appMode == AppMode.TARGET_RANGE) {
+                            // If in target focus mode, tap exits focus mode back to IDLE
+                            appMode = AppMode.IDLE
+                            targetLabel = null
+                            targetColor = null
+                            lockedBox = null
+                            beeper.distance = null
+                            prox.reset()
+                            hasAnnouncedFound = false
+                            speaker.say("Exited target mode. Tap to scan.")
+                            lastSpoken = "Tap to scan."
+                        } else {
+                            // In IDLE, tap starts listing scan
+                            targetLabel = null
+                            targetColor = null
+                            lockedBox = null
+                            listening = false
+                            hasAnnouncedFound = false
+                            appMode = AppMode.LISTING
+                        }
+                    },
+                    onLongPress = {
+                        // reset any active target so beeping stops while speaking
+                        appMode = AppMode.IDLE
                         targetLabel = null
                         targetColor = null
                         lockedBox = null
-                        listening = false
-                        hasAnnouncedFound = false // Reset here too
-                        appMode = AppMode.LISTING
+                        beeper.distance = null
+                        prox.reset()
+                        hasAnnouncedFound = false
+
+                        // audible info
+                        chime.ready()
+
+                        // read out the instructions
+                        val instructions = "Instructions: Tilt the phone to align the screen until vibration." +
+                                "Tap once to scan the table. " +
+                                "Speak an item name to lock on. " +
+                                "Reach forward; the beeper speeds up as you get closer. " +
+                                "Tap once to cancel. " +
+                                "Shake the phone to toggle the flashlight. " +
+                                "Hold the screen anytime to hear this again."
+
+                        speaker.say(instructions)
+                        lastSpoken = "Reading instructions..."
                     }
                 )
             },
@@ -745,12 +773,14 @@ fun CameraPreview() {
         val bmp = frame
         if (bmp != null) {
             Box(Modifier.fillMaxWidth().aspectRatio(bmp.width.toFloat() / bmp.height)) {
+                //live cam feed
                 Image(
                     bitmap = bmp.asImageBitmap(),
                     contentDescription = null,
                     modifier = Modifier.fillMaxSize(),
                     contentScale = ContentScale.FillBounds
                 )
+                //visual overlays
                 Canvas(Modifier.fillMaxSize()) {
                     val pts = points
                     val scaleX = size.width / bmp.width
@@ -769,6 +799,8 @@ fun CameraPreview() {
                             drawCircle(Color.Red, 10f, Offset(p.x * size.width, p.y * size.height))
                         }
                     }
+
+                    //reaching fingertip
                     val fingerTip = if (pts.size == 21 && lockedBox != null) {
                         val t = lockedBox!!
                         val cx = ((t.left + t.right) / 2f) * scaleX
@@ -777,6 +809,7 @@ fun CameraPreview() {
                             .minByOrNull { hypot(it.x - cx, it.y - cy) }
                     } else null
 
+                    //draw bounding boxes for objs
                     detectedObjects.forEach { obj ->
                         val left = obj.boundingBox.left * scaleX
                         val top = obj.boundingBox.top * scaleY
@@ -791,11 +824,12 @@ fun CameraPreview() {
                             style = Stroke(width = if (isTarget) 8f else 4f)
                         )
 
+                        //box labels
                         val textLabel = "${obj.label} ${(obj.score * 100).toInt()}%"
                         val textLayoutResult = textMeasurer.measure(
                             text = textLabel,
                             style = TextStyle(
-                                color = Color.Yellow,
+                                color = if (isTarget) Color.Cyan else Color.Yellow,
                                 fontSize = 14.sp,
                                 fontWeight = FontWeight.Bold
                             )
@@ -819,6 +853,7 @@ fun CameraPreview() {
                         )
                     }
 
+                    //distance between closest and finger
                     val target = lockedBox
                     if (fingerTip != null && target != null && appMode == AppMode.TARGET_RANGE) {
                         val cx = ((target.left + target.right) / 2f) * scaleX
@@ -855,7 +890,7 @@ fun CameraPreview() {
             }
         }
 
-        // Diagnostic Text Display
+        // live diagnostic display
         Text(
             "FPS: $fps   |   $lastSpoken" + if (debugText.isNotEmpty()) "\n$debugText" else "",
             color = Color.White,

@@ -27,7 +27,7 @@ import kotlin.math.sqrt
 @Composable
 fun rememberShakeDetector(
     enabled: Boolean = true,
-    shakeThresholdG: Float = 2.5f, //standard apparently
+    shakeThresholdG: Float = 3.0f, //standard apparently
     cooldownMs: Long = 1200L,
     onShake: () -> Unit
 ) {

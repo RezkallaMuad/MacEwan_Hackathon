@@ -18,21 +18,19 @@ import kotlin.math.sin
 class ProximityBeeper {
     private var job: Job? = null
 
-    /** 0f = dead center of target, 1f = far away, null = no hand or object found */
     @Volatile var distance: Float? = null
-
-    /** When true (app in background / screen off), no beeps. */
     @Volatile var muted = false
 
-    /** Time constant of the distance smoothing. Higher = steadier but slower to react. */
-    private val SMOOTHING_MS = 250f
+    // REDUCED from 250ms to 70ms: 3.5x faster reaction to rapid hand moves!
+    private val SMOOTHING_MS = 70f
 
     private val sampleRate = 22050
-    private val beepSamples = (sampleRate * 0.06).toInt() // 60 ms beep
+    // Shortened to 30ms so rapid-fire clicks don't overlap or buffer-choke
+    private val beepSamples = (sampleRate * 0.030).toInt()
 
     private val track: AudioTrack = run {
         val pcm = ShortArray(beepSamples) { i ->
-            val fade = minOf(1f, i / 200f, (beepSamples - i) / 200f) // avoids clicks
+            val fade = minOf(1f, i / 100f, (beepSamples - i) / 100f) // avoids clicks
             (sin(2.0 * PI * 880.0 * i / sampleRate) * Short.MAX_VALUE * fade)
                 .toInt().toShort()
         }
@@ -69,10 +67,6 @@ class ProximityBeeper {
             var smoothed = 1f
             var lastValidTime = 0L
             var lastTick = SystemClock.uptimeMillis()
-            // Progress toward the next beep: 0 = just beeped, 1 = beep now.
-            // Advancing a phase (instead of "time since last beep >= interval") means a
-            // sudden change in distance smoothly speeds up / slows down the rhythm rather
-            // than firing a beep immediately, which is what made it crackle like a Geiger counter.
             var phase = 1f
 
             while (isActive) {
@@ -89,24 +83,32 @@ class ProximityBeeper {
                 }
                 val d = distance
 
-                // Time-based low-pass filter (same feel regardless of loop timing).
                 val alpha = 1f - exp(-dt / SMOOTHING_MS)
                 if (d != null) {
                     lastValidTime = now
-                    smoothed += (d.coerceIn(0f, 1f) - smoothed) * alpha
-                } else if (now - lastValidTime > 500) {
-                    // Grace period: hold distance for up to 500ms during frame dropouts
+                    val target = d.coerceIn(0f, 1f)
+                    // If we are touching / very close (< 0.15), snap immediately with no delay!
+                    if (target < 0.15f) {
+                        smoothed = target
+                    } else {
+                        smoothed += (target - smoothed) * alpha
+                    }
+                } else if (now - lastValidTime > 300) {
                     smoothed += (1f - smoothed) * alpha
                 }
 
-                val hasActiveTarget = (d != null) || (now - lastValidTime <= 500)
+                val hasActiveTarget = (d != null) || (now - lastValidTime <= 300)
                 val closeness = (1f - smoothed).coerceIn(0f, 1f)
-                val eased = closeness.toDouble().pow(1.1).toFloat()
-                val intervalMs = 1000f - eased * 880f // 1000 ms far -> 120 ms close
-                val volume = 0.15f + 0.85f * eased
+
+                // pow(0.75) ramps up earlier in the reaching path
+                val eased = closeness.toDouble().pow(0.75).toFloat()
+
+                // Fast range: 800ms interval (far) down to 50ms (touching = rapid geiger clicks!)
+                val intervalMs = 800f - (eased * 750f)
+                val volume = 0.2f + 0.8f * eased
 
                 if (!hasActiveTarget) {
-                    phase = 1f // beep right away when a target appears
+                    phase = 1f
                 } else {
                     phase += dt / intervalMs
                     if (phase >= 1f) {
@@ -115,7 +117,7 @@ class ProximityBeeper {
                     }
                 }
 
-                delay(16) // ~60 Hz loop
+                delay(12) // ~80 Hz check loop for instant response
             }
         }
     }
