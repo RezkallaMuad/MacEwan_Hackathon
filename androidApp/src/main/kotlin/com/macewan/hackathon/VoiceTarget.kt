@@ -3,6 +3,9 @@ package com.macewan.hackathon
 import android.content.Context
 import android.content.Intent
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
@@ -42,18 +45,54 @@ fun matchLabel(spoken: String): String? {
 
 class VoiceTarget(
     private val context: Context,
-    private val onResult: (String?) -> Unit
+    /** (label, color) — color is null if none was said. Both null if nothing matched. */
+    private val onResult: (String?, String?) -> Unit
 ) {
     private val recognizer = SpeechRecognizer.createSpeechRecognizer(context)
+    private val handler = Handler(Looper.getMainLooper())
+    private var active = false
+    private var deadline = 0L
+
+    private val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+        putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+        putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)
+        // Ask the recognizer to wait longer for silence. Some recognizers ignore these,
+        // which is why we also restart listening below until the window runs out.
+        putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 2500L)
+        putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 2500L)
+    }
+
+    /** Restart listening if there's still time left in the window. Returns false if time is up. */
+    private fun retry(): Boolean {
+        if (!active || SystemClock.uptimeMillis() >= deadline) return false
+        handler.postDelayed({ if (active) recognizer.startListening(intent) }, 200)
+        return true
+    }
+
+    private fun finish(label: String?, color: String? = null) {
+        if (!active) return
+        active = false
+        onResult(label, color)
+    }
 
     init {
         recognizer.setRecognitionListener(object : RecognitionListener {
             override fun onResults(results: Bundle?) {
                 val heard = results
                     ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION) ?: emptyList()
-                onResult(heard.firstNotNullOfOrNull { matchLabel(it) })
+                val hit = heard.firstNotNullOfOrNull { h -> matchLabel(h)?.let { it to matchColor(h, it) } }
+                // Heard something that isn't an object? Keep listening while there's time.
+                if (hit != null) finish(hit.first, hit.second)
+                else if (!retry()) finish(null)
             }
-            override fun onError(error: Int) = onResult(null)
+            override fun onError(error: Int) {
+                if (!active) return
+                val retryable = error == SpeechRecognizer.ERROR_NO_MATCH ||
+                        error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT ||
+                        error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY ||
+                        error == SpeechRecognizer.ERROR_CLIENT
+                if (!retryable || !retry()) finish(null)
+            }
             override fun onReadyForSpeech(p: Bundle?) {}
             override fun onBeginningOfSpeech() {}
             override fun onRmsChanged(rms: Float) {}
@@ -64,14 +103,29 @@ class VoiceTarget(
         })
     }
 
-    fun listen() {
-        if (!SpeechRecognizer.isRecognitionAvailable(context)) { onResult(null); return }
-        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)
-        }
+    /** Listen for an object name, retrying through silence for up to [windowMs]. */
+    fun listen(windowMs: Long = LISTEN_WINDOW_MS) {
+        if (!SpeechRecognizer.isRecognitionAvailable(context)) { onResult(null, null); return }
+        handler.removeCallbacksAndMessages(null)
+        active = true
+        deadline = SystemClock.uptimeMillis() + windowMs
         recognizer.startListening(intent)
     }
 
-    fun destroy() = recognizer.destroy()
+    /** Stop listening without reporting a result. */
+    fun cancel() {
+        active = false
+        handler.removeCallbacksAndMessages(null)
+        recognizer.cancel()
+    }
+
+    fun destroy() {
+        cancel()
+        recognizer.destroy()
+    }
+
+    companion object {
+        /** Total time to keep listening for an object name. */
+        const val LISTEN_WINDOW_MS = 8000L
+    }
 }

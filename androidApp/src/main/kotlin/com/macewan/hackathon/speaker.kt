@@ -9,6 +9,9 @@ class Speaker(context: Context) {
     private var tts: TextToSpeech? = null
     @Volatile private var ready = false
 
+    /** When true (app in background / screen off), say() is ignored. */
+    @Volatile var muted = false
+
     // Hold messages requested before TTS is fully initialized
     private val pendingMessages = mutableListOf<String>()
 
@@ -38,6 +41,7 @@ class Speaker(context: Context) {
     }
 
     fun say(text: String, flush: Boolean = true) {
+        if (muted) return
         if (ready) {
             // QUEUE_FLUSH interrupts current speech, QUEUE_ADD waits its turn
             val queueMode = if (flush) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD
@@ -49,6 +53,12 @@ class Speaker(context: Context) {
                 pendingMessages.add(text)
             }
         }
+    }
+
+    /** Stop talking right now and drop anything queued. */
+    fun stop() {
+        synchronized(pendingMessages) { pendingMessages.clear() }
+        tts?.stop()
     }
 
     fun shutdown() {

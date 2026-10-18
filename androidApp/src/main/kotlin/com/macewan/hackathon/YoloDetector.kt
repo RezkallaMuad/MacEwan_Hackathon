@@ -18,10 +18,15 @@ class YoloDetector(
     private val iouThreshold: Float = 0.5f,
     private val maxResults: Int = 10,
     /** Boxes as 0..1. If boxes look tiny or stuck top-left, set to false. */
-    private val normalizedOutput: Boolean = true
-
+    private val normalizedOutput: Boolean = true,
+    /** Try the GPU (slow first load, fast inference). False = CPU only, loads in seconds. */
+    useGpu: Boolean = true
 ) {
     private val interpreter: Interpreter
+    private var gpu: GpuDelegate? = null
+
+    /** True if running on the GPU. */
+    val usingGpu: Boolean get() = gpu != null
     private val inW: Int
     private val inH: Int
     private val numAnchors: Int
@@ -36,13 +41,21 @@ class YoloDetector(
         val buffer = FileInputStream(fd.fileDescriptor).channel
             .map(FileChannel.MapMode.READ_ONLY, fd.startOffset, fd.declaredLength)
 
-        val options = Interpreter.Options()
-        try {
-            options.addDelegate(GpuDelegate())
+        // GPU first; if the delegate or the model fails on it, fall back to CPU.
+        var delegate: GpuDelegate? = null
+        interpreter = if (!useGpu) {
+            Interpreter(buffer, Interpreter.Options().setNumThreads(4))
+        } else try {
+            delegate = cachedGpuDelegate(context, modelName, fd.declaredLength)
+            Interpreter(buffer, Interpreter.Options().addDelegate(delegate))
         } catch (e: Throwable) {
-            options.setNumThreads(4)   // CPU fallback
+            Log.w("Yolo", "GPU delegate failed, using CPU", e)
+            delegate?.close()
+            delegate = null
+            Interpreter(buffer, Interpreter.Options().setNumThreads(4))
         }
-        interpreter = Interpreter(buffer, options)
+        gpu = delegate
+        Log.d("Yolo", "usingGpu=${gpu != null}")
 
         val inShape = interpreter.getInputTensor(0).shape()
         channelsFirst = inShape[1] == 3                    // [1,3,H,W] vs [1,H,W,3]
@@ -134,7 +147,10 @@ class YoloDetector(
         return inter / (a.width() * a.height() + b.width() * b.height() - inter)
     }
 
-    fun close() = interpreter.close()
+    fun close() {
+        interpreter.close()
+        gpu?.close()
+    }
 
     companion object {
         val COCO = listOf(
