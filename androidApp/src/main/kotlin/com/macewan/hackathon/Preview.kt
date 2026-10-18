@@ -52,6 +52,9 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.TextStyle
@@ -73,6 +76,8 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.hypot
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import androidx.compose.runtime.rememberCoroutineScope
 
 enum class AppMode {
     IDLE, LISTING, TARGET_RANGE
@@ -137,6 +142,15 @@ private fun cameraIdOf(info: CameraInfo): String =
 private class YoloSlot(val det: YoloDetector, val exec: ExecutorService)
 
 //unified representation of oject YOLO
+/**
+ * Tracks the current touch so swipes don't count as single taps. A tap only counts if,
+ * when the finger lifts, it never slid past the touch slop.
+ */
+private class TouchTracker {
+    var moved = false
+    val isTap: Boolean get() = !moved
+}
+
 data class DetectedItem(val label: String, val score: Float, val boundingBox: RectF)
 val IGNORED_LABELS = setOf("person", "dining table")
 
@@ -280,6 +294,8 @@ fun CameraPreview() {
     val beeper = remember { ProximityBeeper() }
     LaunchedEffect(Unit) { beeper.start(this) }
     val chime = remember { Chime() }
+    val uiScope = rememberCoroutineScope()
+    val touch = remember { TouchTracker() }
     val speaker = remember { Speaker(context) }
 
     //shake gesture
@@ -711,10 +727,28 @@ fun CameraPreview() {
             .fillMaxSize()
             .background(Color.Black)
             .statusBarsPadding()
+            // Watch every touch on the Initial pass (before the tap handler below) and flag
+            // swipes, e.g. swiping up from the bottom to bring up the Android buttons.
+            .pointerInput(Unit) {
+                awaitEachGesture {
+                    val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+                    touch.moved = false
+                    val slop = viewConfiguration.touchSlop
+                    do {
+                        val ev = awaitPointerEvent(PointerEventPass.Initial)
+                        for (c in ev.changes) {
+                            if ((c.position - down.position).getDistance() > slop) touch.moved = true
+                        }
+                    } while (ev.changes.any { it.pressed })
+                }
+            }
             //global screen tapping handler
             .pointerInput(modelsReady, appMode) {
                 detectTapGestures(
                     onTap = {
+                        // Fires when the finger lifts; ignore it if the finger slid (a swipe,
+                        // e.g. swiping up for the Android buttons) instead of tapping.
+                        if (!touch.isTap) return@detectTapGestures
                         if (!modelsReady) {
                             chime.pending()
                             return@detectTapGestures
@@ -741,6 +775,32 @@ fun CameraPreview() {
                             appMode = AppMode.LISTING
                         }
                     },
+                    // Double tap: skip the scan and go straight to saying the item
+                    onDoubleTap = {
+                        if (!modelsReady) {
+                            chime.pending()
+                            return@detectTapGestures
+                        }
+                        if (!micOk) {
+                            micLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                            return@detectTapGestures
+                        }
+                        voice.cancel()
+                        appMode = AppMode.IDLE   // also stops a scan or target in progress
+                        targetLabel = null
+                        targetColor = null
+                        lockedBox = null
+                        beeper.distance = null
+                        prox.reset()
+                        hasAnnouncedFound = false
+                        listening = true
+                        lastSpoken = "Listening..."
+                        speaker.say("What item?")
+                        uiScope.launch {
+                            delay(1100) // let the prompt finish so the mic doesn't hear it
+                            if (listening) voice.listen()
+                        }
+                    },
                     onLongPress = {
                         // reset any active target so beeping stops while speaking
                         appMode = AppMode.IDLE
@@ -755,8 +815,9 @@ fun CameraPreview() {
                         chime.ready()
 
                         // read out the instructions
-                        val instructions = "Instructions: Tilt the phone to align the screen until vibration." +
+                        val instructions = "Instructions: Tilt the phone to align the screen until vibration. " +
                                 "Tap once to scan the table. " +
+                                "Or double tap to name an item right away. " +
                                 "Speak an item name to lock on. " +
                                 "Reach forward; the beeper speeds up as you get closer. " +
                                 "Tap once to cancel. " +
